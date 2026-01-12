@@ -64,7 +64,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, type Queryable, type QueryType } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -227,28 +227,6 @@ function computeDisplayPath(
 
   // Absolute fallback: use full path (should be unique)
   return filepath;
-}
-
-// Rerank documents using node-llama-cpp cross-encoder model
-async function rerank(query: string, documents: { file: string; text: string }[], _model: string = DEFAULT_RERANK_MODEL, _db?: Database): Promise<{ file: string; score: number }[]> {
-  if (documents.length === 0) return [];
-
-  const total = documents.length;
-  process.stderr.write(`Reranking ${total} documents...\n`);
-  progress.indeterminate();
-
-  const llm = getDefaultLlamaCpp();
-  const rerankDocs: RerankDocument[] = documents.map((doc) => ({
-    file: doc.file,
-    text: doc.text.slice(0, 4000), // Truncate to context limit
-  }));
-
-  const result = await llm.rerank(query, rerankDocs);
-
-  progress.clear();
-  process.stderr.write("\n");
-
-  return result.results.map((r) => ({ file: r.file, score: r.score }));
 }
 
 function formatTimeAgo(date: Date): string {

@@ -21,6 +21,7 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
+import { disposeDefaultLlamaCpp } from "./llm.js";
 import type { RankedResult } from "./store.js";
 
 // =============================================================================
@@ -625,10 +626,11 @@ You can also access documents directly via the \`qmd://\` URI scheme:
   // Keep server alive until transport closes or signal received
   return new Promise<void>((resolve) => {
     let shuttingDown = false;
-    const shutdown = (reason: string) => {
+    const shutdown = async (reason: string) => {
       if (shuttingDown) return;
       shuttingDown = true;
       console.error(`[qmd] shutdown: ${reason}`);
+      await disposeDefaultLlamaCpp();
       store.close();
       resolve();
     };
