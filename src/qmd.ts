@@ -55,6 +55,7 @@ import {
   getCollectionsWithoutContext,
   getTopLevelPathsWithoutContext,
   handelize,
+  rerankByChunks,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
@@ -63,7 +64,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, type Queryable, type QueryType } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -226,28 +227,6 @@ function computeDisplayPath(
 
   // Absolute fallback: use full path (should be unique)
   return filepath;
-}
-
-// Rerank documents using node-llama-cpp cross-encoder model
-async function rerank(query: string, documents: { file: string; text: string }[], _model: string = DEFAULT_RERANK_MODEL, _db?: Database): Promise<{ file: string; score: number }[]> {
-  if (documents.length === 0) return [];
-
-  const total = documents.length;
-  process.stderr.write(`Reranking ${total} documents...\n`);
-  progress.indeterminate();
-
-  const llm = getDefaultLlamaCpp();
-  const rerankDocs: RerankDocument[] = documents.map((doc) => ({
-    file: doc.file,
-    text: doc.text.slice(0, 4000), // Truncate to context limit
-  }));
-
-  const result = await llm.rerank(query, rerankDocs);
-
-  progress.clear();
-  process.stderr.write("\n");
-
-  return result.results.map((r) => ({ file: r.file, score: r.score }));
 }
 
 function formatTimeAgo(date: Date): string {
@@ -1689,7 +1668,7 @@ function reciprocalRankFusion(
   weights: number[] = [],  // Weight per result list (default 1.0)
   k: number = 60
 ): RankedResult[] {
-  const scores = new Map<string, { score: number; displayPath: string; title: string; body: string; bestRank: number }>();
+  const scores = new Map<string, { score: number; displayPath: string; title: string; body: string; hash: string; bestRank: number }>();
 
   for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
     const results = resultLists[listIdx];
@@ -1704,7 +1683,7 @@ function reciprocalRankFusion(
         existing.score += rrfScore;
         existing.bestRank = Math.min(existing.bestRank, rank);
       } else {
-        scores.set(doc.file, { score: rrfScore, displayPath: doc.displayPath, title: doc.title, body: doc.body, bestRank: rank });
+        scores.set(doc.file, { score: rrfScore, displayPath: doc.displayPath, title: doc.title, body: doc.body, hash: doc.hash, bestRank: rank });
       }
     }
   }
@@ -1712,11 +1691,11 @@ function reciprocalRankFusion(
   // Add bonus for best rank: documents that ranked #1-3 in any list get a boost
   // This prevents dilution of exact matches by expansion queries
   return Array.from(scores.entries())
-    .map(([file, { score, displayPath, title, body, bestRank }]) => {
+    .map(([file, { score, displayPath, title, body, hash, bestRank }]) => {
       let bonus = 0;
       if (bestRank === 0) bonus = 0.05;  // Ranked #1 somewhere
       else if (bestRank <= 2) bonus = 0.02;  // Ranked top-3 somewhere
-      return { file, displayPath, title, body, score: score + bonus };
+      return { file, displayPath, title, body, hash, score: score + bonus };
     })
     .sort((a, b) => b.score - a.score);
 }
@@ -1768,7 +1747,7 @@ function addLineNumbers(text: string, startLine: number = 1): string {
   return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
 }
 
-function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
+function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; firstChunk?: string; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
   if (filtered.length === 0) {
@@ -1785,6 +1764,8 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
       let body = opts.full ? row.body : undefined;
       let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos).snippet : undefined;
+      // Include intro (first chunk) when snippet is from a different location
+      const intro = (!opts.full && row.firstChunk && row.chunkPos && row.chunkPos > 0) ? row.firstChunk : undefined;
       if (opts.lineNumbers) {
         if (body) body = addLineNumbers(body);
         if (snippet) snippet = addLineNumbers(snippet);
@@ -1796,6 +1777,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
         title: row.title,
         ...(row.context && { context: row.context }),
         ...(body && { body }),
+        ...(intro && { intro }),
         ...(snippet && { snippet }),
       };
     });
@@ -1837,6 +1819,20 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       const score = formatScore(row.score);
       console.log(`Score: ${c.bold}${score}${c.reset}`);
       console.log();
+
+      // Show intro (first chunk) when snippet is from a different location
+      const showIntro = row.firstChunk && row.chunkPos && row.chunkPos > 0;
+      if (showIntro) {
+        // Truncate intro for display (first ~300 chars)
+        let introText = row.firstChunk!;
+        if (introText.length > 300) {
+          introText = introText.substring(0, 297) + "...";
+        }
+        console.log(`${c.dim}--- Intro (first chunk) ---${c.reset}`);
+        console.log(introText);
+        console.log();
+        console.log(`${c.dim}--- Best match ---${c.reset}`);
+      }
 
       // Snippet with highlighting (diff-style header included)
       let displaySnippet = opts.lineNumbers ? addLineNumbers(snippet, line) : snippet;
@@ -2120,7 +2116,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
           // Mutex for hashMap is not strictly needed as it's just adding values
           hashMap.set(r.filepath, r.hash);
         }
-        rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+        rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", hash: r.hash, score: r.score })));
       }
     })());
   }
@@ -2133,7 +2129,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
         const vecResults = await searchVec(db, q, embedModel, 20, (collectionName || "") as any);
         if (vecResults.length > 0) {
           for (const r of vecResults) hashMap.set(r.filepath, r.hash);
-          rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
+          rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", hash: r.hash, score: r.score })));
         }
       })());
     }
@@ -2155,55 +2151,22 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
     return;
   }
 
-  // Rerank multiple chunks per document, then aggregate scores
-  // This improves ranking for long documents where keyword-matched chunk isn't always best
-  // We only rerank ONE chunk per document (best chunk by a simple keyword heuristic),
-  // so we never rerank more than RERANK_DOC_LIMIT items.
-  const chunksToRerank: { file: string; text: string; chunkIdx: number }[] = [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
-
-  const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-  for (const c of candidates) {
-    const chunks = chunkDocument(c.body);
-    if (chunks.length === 0) continue;
-
-    // Choose best chunk by keyword matches; fall back to first chunk.
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      if (score > bestScore) {
-        bestScore = score;
-        bestIdx = i;
-      }
-    }
-
-    chunksToRerank.push({ file: c.file, text: chunks[bestIdx]!.text, chunkIdx: bestIdx });
-    docChunkMap.set(c.file, { chunks, bestIdx });
-  }
-
-  // Rerank selected chunks (with caching). One chunk per doc -> one rerank item per doc.
-  const reranked = await rerank(
+  // Rerank all chunks per document, then aggregate scores using normalized top-K
+  // This is fairer to both short and long documents than single-chunk reranking
+  const reranked = await rerankByChunks(
     query,
-    chunksToRerank.map(c => ({ file: c.file, text: c.text })),
+    candidates.map(c => ({ file: c.file, hash: c.hash, body: c.body })),
     rerankModel,
     db
   );
-
-  const aggregatedScores = new Map<string, { score: number; bestChunkIdx: number }>();
-  for (const r of reranked) {
-    const chunkInfo = docChunkMap.get(r.file);
-    aggregatedScores.set(r.file, { score: r.score, bestChunkIdx: chunkInfo?.bestIdx ?? 0 });
-  }
 
   // Blend RRF position score with aggregated reranker score using position-aware weights
   // Top retrieval results get more protection from reranker disagreement
   const candidateMap = new Map(candidates.map(c => [c.file, { displayPath: c.displayPath, title: c.title, body: c.body }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1])); // 1-indexed rank
 
-  const finalResults = Array.from(aggregatedScores.entries()).map(([file, { score: rerankScore, bestChunkIdx }]) => {
-    const rrfRank = rrfRankMap.get(file) || 30;
+  const finalResults = reranked.map(r => {
+    const rrfRank = rrfRankMap.get(r.file) || 30;
     // Position-aware blending: top retrieval results preserved more
     // Rank 1-3: 75% RRF, 25% reranker (trust retrieval for exact matches)
     // Rank 4-10: 60% RRF, 40% reranker
@@ -2217,21 +2180,18 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
       rrfWeight = 0.40;
     }
     const rrfScore = 1 / rrfRank;  // Position-based: 1, 0.5, 0.33...
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * rerankScore;
-    const candidate = candidateMap.get(file);
-    // Use the best-scoring chunk's text for the body (better for snippets)
-    const chunkInfo = docChunkMap.get(file);
-    const chunkBody = chunkInfo ? (chunkInfo.chunks[bestChunkIdx]?.text || chunkInfo.chunks[0]!.text) : candidate?.body || "";
-    const chunkPos = chunkInfo ? (chunkInfo.chunks[bestChunkIdx]?.pos || 0) : 0;
+    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const candidate = candidateMap.get(r.file);
     return {
-      file,
+      file: r.file,
       displayPath: candidate?.displayPath || "",
       title: candidate?.title || "",
-      body: chunkBody,
-      chunkPos,
+      body: candidate?.body || "",
+      chunkPos: r.bestChunkPos,
+      firstChunk: r.firstChunk,
       score: blendedScore,
-      context: getContextForFile(db, file),
-      hash: hashMap.get(file) || "",
+      context: getContextForFile(db, r.file),
+      hash: hashMap.get(r.file) || "",
     };
   }).sort((a, b) => b.score - a.score);
 

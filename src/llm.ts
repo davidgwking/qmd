@@ -799,7 +799,9 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    // Disable inactivity timeout to prevent context disposal during operations.
+    // Context disposal is handled explicitly on shutdown.
+    defaultLlamaCpp = new LlamaCpp({ inactivityTimeoutMs: 0 });
   }
   return defaultLlamaCpp;
 }
